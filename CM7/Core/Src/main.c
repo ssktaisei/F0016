@@ -180,7 +180,7 @@ Error_Handler();
   MX_SPI2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
-
+  App();
   /* USER CODE END 2 */
 
   /* Infinite loop */
