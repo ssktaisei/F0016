@@ -53,3 +53,9 @@ dkms.conf
 
 # debug information files
 *.dwo
+
+# stm32
+f0016b.pdf
+Debug
+CM4/.settings
+CM7/.settings
