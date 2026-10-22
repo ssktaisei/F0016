@@ -302,11 +302,51 @@ int App(void)
     */
     ST7789_Init();
 
-    /*
-    * Red
-    */
     ST7789_FillScreen(ST7789_RED);
     HAL_Delay(1000);
+
+
+    /*
+    * Green
+    */
+    ST7789_FillScreen(ST7789_GREEN);
+    //  HAL_Delay(1000);
+
+    /*
+    * Blue
+    */
+    ST7789_FillScreen(ST7789_BLUE);
+    //  HAL_Delay(1000);
+
+    /*
+    * Black
+    */
+    ST7789_FillScreen(ST7789_BLACK);
+
+    /*
+    * Draw some rectangles
+    */
+    ST7789_FillRect(
+        10, 10,
+        100, 50,
+        ST7789_RED
+    );
+
+    ST7789_FillRect(
+        110, 70,
+        100, 50,
+        ST7789_GREEN
+    );
+
+    ST7789_FillRect(
+        50, 140,
+        220, 50,
+        ST7789_BLUE
+    );
+
+    HAL_Delay(1000);
+
+
     while (1) {
         LCD_WriteCommand(0x21);  /* INVON */
         HAL_Delay(500);
