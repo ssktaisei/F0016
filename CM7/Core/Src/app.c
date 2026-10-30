@@ -347,11 +347,23 @@ int App(void)
     HAL_Delay(1000);
 
 
-    while (1) {
+    for (int i = 0; i < 5; i++) {
         LCD_WriteCommand(0x21);  /* INVON */
         HAL_Delay(500);
         LCD_WriteCommand(0x20);  /* INVOFF */
         HAL_Delay(500);
+    }
+
+    while (1) {
+        HAL_GPIO_WritePin(VDD33_ON_GPIO_Port, VDD33_ON_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(VDD50_ON_GPIO_Port, VDD50_ON_Pin, GPIO_PIN_SET);
+        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_SET);
+        HAL_Delay(5000);
+
+        HAL_GPIO_WritePin(VDD33_ON_GPIO_Port, VDD33_ON_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(VDD50_ON_GPIO_Port, VDD50_ON_Pin, GPIO_PIN_RESET);
+        HAL_GPIO_WritePin(LED0_GPIO_Port, LED0_Pin, GPIO_PIN_RESET);
+        HAL_Delay(5000);
     }
 
     // /*
