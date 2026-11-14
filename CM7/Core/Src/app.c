@@ -261,6 +261,125 @@ static void LCD_FillScreen(uint16_t color)
 }
 #endif
 
+
+/*
+ * pcm5102_audio_sai.c
+ * STM32H757 (CM7側想定) の SAI1 Block A (I2Sプロトコル) + PCM5102 で
+ * DMA循環により 1kHz正弦波を 48kHz/16bit ステレオで出力する
+ *
+ * ---- CubeMX設定 (SAI1 Block A) ----
+ *   Mode / Protocol : Master Transmitter / I2S Standard (I2S/PCM Protocol)
+ *   Audio Frequency : 48 kHz
+ *   Data Size       : 16 Bits
+ *   Slot            : 2スロット(ステレオ)、スロットサイズ 16bit (DataSize)
+ *   Master Clock Out: Disable (PCM5102のSCKはGND接続で内蔵PLL動作)
+ *   DMA (SAI1_A TX) : Circular, Peripheral/Memory Data Width = Half Word,
+ *                     Memory increment = ON
+ *   SAIカーネルクロック: fs x 256 の整数倍に近い周波数にする
+ *                     (例: 49.152MHz = 12.288MHz x 4。PLL設定で誤差を小さく)
+ *
+ * ---- PCM5102 結線 ----
+ *   BCK  <- SAI1_SCK_A
+ *   LRCK <- SAI1_FS_A
+ *   DIN  <- SAI1_SD_A
+ *   SCK  -> GND, FMT -> GND, FLT -> GND, DEMP -> GND, XSMT -> 3.3V
+ *
+ * ---- 使い方 ----
+ *   MX_SAI1_Init() の後に Audio_Start(); を呼ぶ。
+ */
+
+#include "main.h"
+#include <math.h>
+#include <string.h>
+
+extern SAI_HandleTypeDef hsai_BlockA1;
+#define AUDIO_SAI_HANDLE   (&hsai_BlockA1)
+
+#define SAMPLE_RATE_HZ     48000U
+#define TONE_FREQ_HZ       1000U
+#define FRAMES_PER_HALF    256U
+#define CH                 2U
+#define BUF_HALFWORDS      (FRAMES_PER_HALF * CH * 2U)
+#define AMPLITUDE          12000
+
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+
+/*
+ * DMAバッファ: DTCMは不可。AXI SRAM(D1)等に置く(CubeIDE標準の.bssはAXI SRAM)。
+ * CM4からSAIを使う場合はD2のSRAM(SRAM1/2)に置くこと。
+ */
+static int16_t s_audio_buf[BUF_HALFWORDS] __attribute__((aligned(32)));
+
+static float s_phase = 0.0f;
+static const float s_phase_inc =
+    2.0f * (float)M_PI * (float)TONE_FREQ_HZ / (float)SAMPLE_RATE_HZ;
+
+static void fill_half(uint32_t half)
+{
+    int16_t *p = &s_audio_buf[half * FRAMES_PER_HALF * CH];
+
+    for (uint32_t i = 0; i < FRAMES_PER_HALF; i++) {
+        int16_t v = (int16_t)(sinf(s_phase) * AMPLITUDE);
+        *p++ = v;   /* L */
+        *p++ = v;   /* R */
+        s_phase += s_phase_inc;
+        if (s_phase >= 2.0f * (float)M_PI) {
+            s_phase -= 2.0f * (float)M_PI;
+        }
+    }
+
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    SCB_CleanDCache_by_Addr((uint32_t *)&s_audio_buf[half * FRAMES_PER_HALF * CH],
+                            FRAMES_PER_HALF * CH * sizeof(int16_t));
+#endif
+}
+
+void Audio_Start(void)
+{
+    s_phase = 0.0f;
+    memset(s_audio_buf, 0, sizeof(s_audio_buf));
+    fill_half(0);
+    fill_half(1);
+
+#if defined(__DCACHE_PRESENT) && (__DCACHE_PRESENT == 1U)
+    SCB_CleanDCache_by_Addr((uint32_t *)s_audio_buf, sizeof(s_audio_buf));
+#endif
+
+    /* Sizeはデータ個数(16bitなのでハーフワード数) */
+    if (HAL_SAI_Transmit_DMA(AUDIO_SAI_HANDLE,
+                             (uint8_t *)s_audio_buf,
+                             BUF_HALFWORDS) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+void Audio_Stop(void)
+{
+    HAL_SAI_DMAStop(AUDIO_SAI_HANDLE);
+}
+
+void HAL_SAI_TxHalfCpltCallback(SAI_HandleTypeDef *hsai)
+{
+    if (hsai->Instance == AUDIO_SAI_HANDLE->Instance) {
+        fill_half(0);
+    }
+}
+
+void HAL_SAI_TxCpltCallback(SAI_HandleTypeDef *hsai)
+{
+    if (hsai->Instance == AUDIO_SAI_HANDLE->Instance) {
+        fill_half(1);
+    }
+}
+
+void HAL_SAI_ErrorCallback(SAI_HandleTypeDef *hsai)
+{
+    (void)hsai;
+    /* アンダーラン等。必要なら再起動やログ出力 */
+}
+
 /**
  * @brief	main routine
  *
@@ -353,6 +472,8 @@ int App(void)
         LCD_WriteCommand(0x20);  /* INVOFF */
         HAL_Delay(500);
     }
+
+    Audio_Start();
 
     while (1) {
         HAL_GPIO_WritePin(VDD33_ON_GPIO_Port, VDD33_ON_Pin, GPIO_PIN_SET);

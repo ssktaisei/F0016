@@ -21,7 +21,7 @@
 
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
-
+#include <math.h>
 /* USER CODE END Includes */
 
 /* Private typedef -----------------------------------------------------------*/
@@ -72,7 +72,8 @@ PCD_HandleTypeDef hpcd_USB_OTG_FS;
 SDRAM_HandleTypeDef hsdram1;
 
 /* USER CODE BEGIN PV */
-
+#define AUDIO_FRAMES 480                    /* 1回の送信フレーム数(= サイン波10周期分) */
+static int16_t audio_buf[AUDIO_FRAMES * 2]; /* L,R インターリーブ */
 /* USER CODE END PV */
 
 /* Private function prototypes -----------------------------------------------*/
@@ -91,11 +92,141 @@ static void MX_USB_OTG_FS_PCD_Init(void);
 static void MX_SPI2_Init(void);
 static void MX_TIM3_Init(void);
 /* USER CODE BEGIN PFP */
-
+static void Audio_Test(void);
 /* USER CODE END PFP */
 
 /* Private user code ---------------------------------------------------------*/
 /* USER CODE BEGIN 0 */
+// MARK: USER CODE 0
+
+/*
+ * main.c の USER CODE 0 にある「pcm5102a_test.c」ブロック
+ * (#include <math.h> ～ Pcm5102a_PlayTest の終わりまで) を、これに丸ごと置き換える。
+ *
+ * 変更点
+ *  - CubeMXが生成済みの hsai_BlockA1 を再利用 (ピン設定はCubeMXのMspInitに任せる)
+ *  - 自作ハンドル hsai_a と、推測で書いていた PE4/5/6 のGPIO設定を削除
+ *  - クロックが来ていない場合に固まらないようタイムアウト付き (戻り値 -1)
+ *  - USE_I2S_CKIN=0 で内部PLL1Q(100MHz)に切り替え、原因の切り分けができる
+ */
+#include <math.h>
+#include <stdint.h>
+
+#define USE_I2S_CKIN     1              /* 1: I2S_CKIN(12.288MHz)  0: 内部PLL1Q(切り分け用) */
+
+/* DIN(SAI1_SD_A) をつないだピン。候補: PE6 / PD6 / PC1 / PB2 (すべてAF6)。実配線に合わせる */
+#define SAI_SD_PORT      GPIOE
+#define SAI_SD_PIN       GPIO_PIN_6
+
+#define FS_HZ            48000U
+#define TONE_HZ          480U           /* FS_HZ / TONE_HZ は整数になること */
+#define PLAY_SECONDS     60U
+#define AMPLITUDE        20000
+
+#define FRAMES_PER_PERIOD (FS_HZ / TONE_HZ)
+
+static int16_t sine_tbl[FRAMES_PER_PERIOD];
+
+static void Pcm5102a_SaiReinit(void)
+{
+    RCC_PeriphCLKInitTypeDef pclk = {0};
+    GPIO_InitTypeDef gpio = {0};
+
+    HAL_SAI_DeInit(&hsai_BlockA1);      /* CubeMXがPLL前提で初期化済みなので一旦戻す */
+
+    /* SAI1-A のピンをAFに設定 (このプロジェクトのMspInitにはSAI用のGPIO設定が無い) */
+    __HAL_RCC_SAI1_CLK_ENABLE();
+    __HAL_RCC_GPIOE_CLK_ENABLE();
+    __HAL_RCC_GPIOB_CLK_ENABLE();
+    __HAL_RCC_GPIOC_CLK_ENABLE();
+    __HAL_RCC_GPIOD_CLK_ENABLE();
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = GPIO_AF6_SAI1;
+    gpio.Pin = GPIO_PIN_5;  HAL_GPIO_Init(GPIOE, &gpio);   /* SAI1_SCK_A = BCK  (PE5) */
+    gpio.Pin = GPIO_PIN_4;  HAL_GPIO_Init(GPIOE, &gpio);   /* SAI1_FS_A  = LRCK (PE4) */
+    gpio.Pin = SAI_SD_PIN;  HAL_GPIO_Init(SAI_SD_PORT, &gpio); /* SAI1_SD_A = DIN */
+
+#if USE_I2S_CKIN
+    gpio.Pin       = GPIO_PIN_9;        /* PC9 = I2S_CKIN (AF5) */
+    gpio.Mode      = GPIO_MODE_AF_PP;
+    gpio.Pull      = GPIO_NOPULL;
+    gpio.Speed     = GPIO_SPEED_FREQ_VERY_HIGH;
+    gpio.Alternate = 5U;
+    HAL_GPIO_Init(GPIOC, &gpio);
+
+    pclk.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+    pclk.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PIN;
+    hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_MCKDIV;   /* Fs = 12.288M/256 = 48k */
+    hsai_BlockA1.Init.Mckdiv         = 0;
+#else
+    pclk.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+    pclk.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PLL;               /* PLL1Q = 100MHz */
+    hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;      /* HALが分周を計算 (ほぼ48k) */
+#endif
+    if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK) {
+        Error_Handler();
+    }
+
+    hsai_BlockA1.Init.OutputDrive = SAI_OUTPUTDRIVE_ENABLE;
+
+    /* I2S, 16bitデータ / 32bitスロット (BCK = 64fs), 2スロット */
+    if (HAL_SAI_InitProtocol(&hsai_BlockA1, SAI_I2S_STANDARD,
+                             SAI_PROTOCOL_DATASIZE_16BITEXTENDED, 2) != HAL_OK) {
+        Error_Handler();
+    }
+}
+
+/* FLVL >= 5 : FIFO full */
+static inline int fifo_full(void)
+{
+    return ((hsai_BlockA1.Instance->SR & SAI_xSR_FLVL) >> SAI_xSR_FLVL_Pos) >= 5U;
+}
+
+/* 戻り値: 0=再生完了, -1=タイムアウト(SAIが動いていない=クロックが来ていない可能性) */
+int Pcm5102a_PlayTest(void)
+{
+    uint32_t i, idx = 0;
+    const uint32_t total_words = FS_HZ * PLAY_SECONDS * 2U;
+    uint32_t t0;
+    int ret = 0;
+
+    for (i = 0; i < FRAMES_PER_PERIOD; i++) {
+        sine_tbl[i] = (int16_t)(AMPLITUDE * sinf(2.0f * 3.14159265f * (float)i / (float)FRAMES_PER_PERIOD));
+    }
+
+    Pcm5102a_SaiReinit();
+
+    /* 起動時のアンダーランを避けるためFIFOを先に埋める */
+    while (!fifo_full()) {
+        hsai_BlockA1.Instance->DR = (uint16_t)sine_tbl[(idx >> 1) % FRAMES_PER_PERIOD];
+        idx++;
+    }
+
+    __HAL_SAI_ENABLE(&hsai_BlockA1);
+
+    t0 = HAL_GetTick();
+    while (idx < total_words) {
+        if (!fifo_full()) {
+            hsai_BlockA1.Instance->DR = (uint16_t)sine_tbl[(idx >> 1) % FRAMES_PER_PERIOD];
+            idx++;
+        }
+        if ((HAL_GetTick() - t0) > (PLAY_SECONDS * 1000U + 500U)) {
+            ret = -1;                   /* 想定時間内に送り終わらない */
+            break;
+        }
+    }
+
+    if (ret == 0) {
+        while ((hsai_BlockA1.Instance->SR & SAI_xSR_FLVL) != 0U) {
+            if ((HAL_GetTick() - t0) > (PLAY_SECONDS * 1000U + 1000U)) { ret = -1; break; }
+        }
+        HAL_Delay(2);
+    }
+    __HAL_SAI_DISABLE(&hsai_BlockA1);
+    return ret;
+}
 
 /* USER CODE END 0 */
 
@@ -180,7 +311,16 @@ Error_Handler();
   MX_SPI2_Init();
   MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
+  // MARK: USER CODE 2
+
+  volatile int a = Pcm5102a_PlayTest();
+  while(1);
+
+  // Audio_Test();
   App();
+
+
+
   /* USER CODE END 2 */
 
   /* Infinite loop */
@@ -389,7 +529,7 @@ static void MX_SAI1_Init(void)
   hsai_BlockA1.Init.NoDivider = SAI_MASTERDIVIDER_ENABLE;
   hsai_BlockA1.Init.MckOverSampling = SAI_MCK_OVERSAMPLING_DISABLE;
   hsai_BlockA1.Init.FIFOThreshold = SAI_FIFOTHRESHOLD_EMPTY;
-  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_192K;
+  hsai_BlockA1.Init.AudioFrequency = SAI_AUDIO_FREQUENCY_48K;
   hsai_BlockA1.Init.SynchroExt = SAI_SYNCEXT_DISABLE;
   hsai_BlockA1.Init.MonoStereoMode = SAI_STEREOMODE;
   hsai_BlockA1.Init.CompandingMode = SAI_NOCOMPANDING;
@@ -751,13 +891,16 @@ static void MX_GPIO_Init(void)
   __HAL_RCC_GPIOD_CLK_ENABLE();
 
   /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, OSC32_ENABLE_Pin|LCD_NCS_Pin|LCD_RST_Pin|OSC12M_EN_Pin, GPIO_PIN_SET);
+  HAL_GPIO_WritePin(GPIOC, OSC32_ENABLE_Pin|DAC_FMT_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(OSC_ENABLE_GPIO_Port, OSC_ENABLE_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(MCU_EXRST_GPIO_Port, MCU_EXRST_Pin, GPIO_PIN_SET);
+
+  /*Configure GPIO pin Output Level */
+  HAL_GPIO_WritePin(GPIOC, LCD_NCS_Pin|LCD_RST_Pin|DAC_NSMT_Pin|OSC12M_EN_Pin, GPIO_PIN_SET);
 
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOB, LCD_DC_Pin|VDD33_ON_Pin|VDD50_ON_Pin, GPIO_PIN_RESET);
@@ -771,9 +914,6 @@ static void MX_GPIO_Init(void)
   /*Configure GPIO pin Output Level */
   HAL_GPIO_WritePin(GPIOG, LED0_Pin|LED1_Pin|UI_NCS2_Pin|UI_NCS1_Pin
                           |UI_NCS0_Pin, GPIO_PIN_SET);
-
-  /*Configure GPIO pin Output Level */
-  HAL_GPIO_WritePin(GPIOC, DAC_NSMT_Pin|DAC_FMT_Pin, GPIO_PIN_RESET);
 
   /*Configure GPIO pins : OSC32_ENABLE_Pin LCD_NCS_Pin OSC12M_EN_Pin */
   GPIO_InitStruct.Pin = OSC32_ENABLE_Pin|LCD_NCS_Pin|OSC12M_EN_Pin;
@@ -857,7 +997,50 @@ static void MX_GPIO_Init(void)
 }
 
 /* USER CODE BEGIN 4 */
+static void Audio_Test(void)
+{
 
+  // RCC_PeriphCLKInitTypeDef pclk = {0};
+  // pclk.PeriphClockSelection = RCC_PERIPHCLK_SAI1;
+  // pclk.Sai1ClockSelection   = RCC_SAI1CLKSOURCE_PLL;   /* PLL1Q = 100MHz */
+  // if (HAL_RCCEx_PeriphCLKConfig(&pclk) != HAL_OK)
+  // {
+	// Error_Handler();
+  // }
+  // // HAL_SAI_DeInit(&hsai_BlockA1);
+  // MX_SAI1_Init();
+
+  /* XSMT(ミュート解除)をDAC_NSMTに接続している場合のみ必要 */
+  HAL_GPIO_WritePin(DAC_NSMT_GPIO_Port, DAC_NSMT_Pin, GPIO_PIN_SET);
+
+  /* 48サンプルで1周期 → 約1kHzのサイン波、振幅は約-12dB */
+  for (int i = 0; i < AUDIO_FRAMES; i++)
+  {
+    int16_t v = (int16_t)(8000.0f * sinf(2.0f * 3.14159265f * i / 48.0f));
+    audio_buf[2 * i]     = v;  /* L */
+    audio_buf[2 * i + 1] = v;  /* R */
+  }
+
+  /* 約1秒分(480フレーム ≒ 10ms) x 100回 */
+  while (1)
+  // for (int n = 0; n < 100; n++)
+  {
+    /* 16bitデータなので Size は「サンプル数」(フレーム数 x 2) */
+    HAL_StatusTypeDef ret = HAL_SAI_Transmit(&hsai_BlockA1, (uint8_t *)audio_buf, AUDIO_FRAMES * 2, 1000);
+    if (ret != HAL_OK)
+    {
+      volatile uint32_t err   = HAL_SAI_GetError(&hsai_BlockA1);
+      volatile uint32_t state = HAL_SAI_GetState(&hsai_BlockA1);
+      volatile uint32_t cr1   = hsai_BlockA1.Instance->CR1;   /* bit16 = SAIEN */
+      volatile uint32_t sr    = hsai_BlockA1.Instance->SR;
+      volatile uint32_t apb2  = RCC->APB2ENR;                 /* bit22 = SAI1EN */
+      volatile uint32_t sel   = RCC->D2CCIP1R;                /* bit[2:0] = SAI1SEL */
+      (void)ret; (void)err; (void)state; (void)cr1; (void)sr; (void)apb2; (void)sel;
+      Error_Handler();   /* ここにブレークポイントを置いてウォッチで値を見る */
+    }
+  }
+  __HAL_SAI_DISABLE(&hsai_BlockA1);
+}
 /* USER CODE END 4 */
 
  /* MPU Configuration */
