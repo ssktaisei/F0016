@@ -8,6 +8,7 @@
 #include "../Inc/main.h"
 #include "../../Drivers/BSP/led.h"
 #include "../../Drivers/BSP/lcd.h"
+#include "../../Drivers/BSP/dac.h"
 
 // HAL Handlers extern
 extern I2C_HandleTypeDef hi2c1;
@@ -414,7 +415,7 @@ int App(void)
     }
     return 0;
 #else
-
+    volatile int a = Pcm5102a_PlayTest();
 
     /*
     * LCD initialization
